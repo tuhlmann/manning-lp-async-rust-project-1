@@ -1,7 +1,14 @@
+use async_std::prelude::*;
+use async_std::stream;
 use async_trait::async_trait;
 use chrono::prelude::*;
 use clap::Parser;
-use std::io::{Error, ErrorKind};
+use futures::future::join_all;
+use std::fs;
+use std::{
+    io::{Error, ErrorKind},
+    time::Duration,
+};
 use time::OffsetDateTime;
 use yahoo_finance_api as yahoo;
 
@@ -12,10 +19,12 @@ use yahoo_finance_api as yahoo;
     about = "A Manning LiveProject: async Rust"
 )]
 struct Opts {
-    #[clap(short, long, default_value = "AAPL,MSFT,UBER,GOOG")]
-    symbols: String,
+    #[clap(short, long)]
+    symbols: Option<String>,
     #[clap(short, long)]
     from: String,
+    #[clap(long)]
+    file: Option<String>,
 }
 
 ///
@@ -119,64 +128,6 @@ impl AsyncStockSignal for WindowedSMA {
 }
 
 ///
-/// Calculates the absolute and relative difference between the beginning and ending of an f64 series. The relative difference is relative to the beginning.
-///
-/// # Returns
-///
-/// A tuple `(absolute, relative)` difference.
-///
-fn price_diff(a: &[f64]) -> Option<(f64, f64)> {
-    if !a.is_empty() {
-        // unwrap is safe here even if first == last
-        let (first, last) = (a.first().unwrap(), a.last().unwrap());
-        let abs_diff = last - first;
-        let first = if *first == 0.0 { 1.0 } else { *first };
-        let rel_diff = abs_diff / first;
-        Some((abs_diff, rel_diff))
-    } else {
-        None
-    }
-}
-
-///
-/// Window function to create a simple moving average
-///
-fn n_window_sma(n: usize, series: &[f64]) -> Option<Vec<f64>> {
-    if !series.is_empty() && n > 1 {
-        Some(
-            series
-                .windows(n)
-                .map(|w| w.iter().sum::<f64>() / w.len() as f64)
-                .collect(),
-        )
-    } else {
-        None
-    }
-}
-
-///
-/// Find the maximum in a series of f64
-///
-fn max(series: &[f64]) -> Option<f64> {
-    if series.is_empty() {
-        None
-    } else {
-        Some(series.iter().fold(f64::MIN, |acc, q| acc.max(*q)))
-    }
-}
-
-///
-/// Find the minimum in a series of f64
-///
-fn min(series: &[f64]) -> Option<f64> {
-    if series.is_empty() {
-        None
-    } else {
-        Some(series.iter().fold(f64::MAX, |acc, q| acc.min(*q)))
-    }
-}
-
-///
 /// Retrieve data from a data source and extract the closing prices. Errors during download are mapped onto io::Errors as InvalidData.
 ///
 async fn fetch_closing_data(
@@ -204,38 +155,89 @@ async fn fetch_closing_data(
     }
 }
 
+fn read_symbols_from_file(filename: &str) -> Option<Vec<String>> {
+    let content = fs::read_to_string(filename).ok().map(|s| {
+        s.split(',')
+            .map(|s| String::from(s.trim()))
+            .collect::<Vec<String>>()
+    });
+
+    content
+}
+
+///
+/// Convenience function that chains together the entire processing chain.
+///
+async fn handle_symbol_data(
+    symbol: &str,
+    beginning: &DateTime<Utc>,
+    end: &DateTime<Utc>,
+) -> Option<Vec<f64>> {
+    let closes = fetch_closing_data(symbol, beginning, end).await.ok()?;
+    if !closes.is_empty() {
+        let diff = PriceDifference {};
+        let min = MinPrice {};
+        let max = MaxPrice {};
+        let sma = WindowedSMA { window_size: 30 };
+
+        let period_max: f64 = max.calculate(&closes).await?;
+        let period_min: f64 = min.calculate(&closes).await?;
+
+        let last_price = *closes.last()?;
+        let (_, pct_change) = diff.calculate(&closes).await?;
+        let sma = sma.calculate(&closes).await?;
+
+        // a simple way to output CSV data
+        println!(
+            "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+            beginning.to_rfc3339(),
+            symbol,
+            last_price,
+            pct_change * 100.0,
+            period_min,
+            period_max,
+            sma.last().unwrap_or(&0.0)
+        );
+    }
+    Some(closes)
+}
+
+async fn fetch_all_symbol_data(
+    symbols: &Vec<String>,
+    beginning: &DateTime<Utc>,
+    end: &DateTime<Utc>,
+) -> Vec<Option<Vec<f64>>> {
+    let handles = symbols
+        .iter()
+        .map(|symbol| handle_symbol_data(symbol, beginning, end));
+    join_all(handles).await
+}
+
 #[async_std::main]
 async fn main() -> std::io::Result<()> {
     let opts = Opts::parse();
     let from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
     let to = Utc::now();
+    let file: Option<String> = opts.file;
+
+    let symbols: Vec<String> = file
+        .map(|f| read_symbols_from_file(f.as_str()))
+        .flatten()
+        .or({
+            opts.symbols
+                .map(|s| s.split(',').map(String::from).collect::<Vec<String>>())
+        })
+        .expect("Either pass --file or --symbols to pass the symbols to fetch.");
 
     // a simple way to output a CSV header
     println!("period start,symbol,price,change %,min,max,30d avg");
 
-    for symbol in opts.symbols.split(',') {
-        let closes = fetch_closing_data(&symbol, &from, &to).await?;
-        if !closes.is_empty() {
-            // min/max of the period. unwrap() because those are Option types
-            let period_max: f64 = max(&closes).unwrap();
-            let period_min: f64 = min(&closes).unwrap();
-            let last_price = *closes.last().unwrap_or(&0.0);
-            let (_, pct_change) = price_diff(&closes).unwrap_or((0.0, 0.0));
-            let sma = n_window_sma(30, &closes).unwrap_or_default();
-
-            // a simple way to output CSV data
-            println!(
-                "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
-                from.to_rfc3339(),
-                symbol,
-                last_price,
-                pct_change * 100.0,
-                period_min,
-                period_max,
-                sma.last().unwrap_or(&0.0)
-            );
-        }
+    // Run every 30 seconds
+    let mut interval = stream::interval(Duration::from_secs(30));
+    while let Some(_) = interval.next().await {
+        fetch_all_symbol_data(&symbols, &from, &to).await;
     }
+
     Ok(())
 }
 
